@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"image"
@@ -30,28 +31,25 @@ func main() {
 }
 
 func run() error {
-	var paletteChars string
-	var invert bool
 	var sizeRaw string
-	var targetWidth int
-	var targetHeight int
-	var scaler string
-	var renderer string
-	var varName string
+	var mapFile string
+	var gen Generator
 
 	flags := flag.NewFlagSet("", 0)
-	flags.StringVar(&paletteChars, "pal", "_cowgCONW", "Palette chars, ordered from least to most intense. Must be valid C++ identifier characters.")
 	flags.StringVar(&sizeRaw, "size", "", "Size, in '<w>x<h>' format. <=0 for either dimension for aspect.")
-	flags.StringVar(&scaler, "scaler", "catmullrom", "Scaler when resizing. Values: nn, approxbilinear, bilinear, catmullrom.")
-	flags.StringVar(&renderer, "renderer", "cpp", "Renderer. Values: cpp, js.")
-	flags.StringVar(&varName, "var", "bitmap", "Output variable name.")
-	flags.BoolVar(&invert, "invert", false, "Invert colours")
+	flags.StringVar(&gen.PaletteChars, "chars", "_cowgCONW", "Palette chars, ordered from least to most intense. Must be valid identifier characters.")
+	flags.StringVar(&gen.Scaler, "scaler", "catmullrom", "Scaler when resizing. Values: nn, approxbilinear, bilinear, catmullrom.")
+	flags.StringVar(&gen.Renderer, "renderer", "cpp17", "Renderer. Values: cpp17, cpp, js.")
+	flags.StringVar(&gen.VarName, "var", "bitmap", "Output variable name.")
+	flags.BoolVar(&gen.Invert, "invert", false, "Invert colours")
+	flags.StringVar(&mapFile, "map", "", "Image map file (defines regions")
+	flags.IntVar(&gen.PaletteOffset, "offset", 0, "Palette offset")
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
 	}
 
 	if len(sizeRaw) > 0 {
-		if _, err := fmt.Sscanf(sizeRaw, "%dx%d", &targetWidth, &targetHeight); err != nil {
+		if _, err := fmt.Sscanf(sizeRaw, "%dx%d", &gen.TargetWidth, &gen.TargetHeight); err != nil {
 			return err
 		}
 	}
@@ -60,33 +58,88 @@ func run() error {
 	if len(args) != 1 {
 		return fmt.Errorf("missing <input> arg")
 	}
+
 	input := args[0]
 	img, err := decode(input)
 	if err != nil {
 		return err
 	}
 
+	if mapFile != "" {
+		mapBts, err := os.ReadFile(mapFile)
+		if err != nil {
+			return err
+		}
+		var imap = ImageMap{Gen: &gen}
+		var dec = json.NewDecoder(bytes.NewReader(mapBts))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&imap); err != nil {
+			return err
+		}
+
+		for idx, area := range imap.Areas {
+			sub := subImage(img, area.Rect())
+			out, err := area.Gen.Build(sub)
+			if err != nil {
+				return err
+			}
+
+			if idx > 0 {
+				fmt.Println()
+			}
+			fmt.Println(out)
+		}
+
+	} else {
+		out, err := gen.Build(img)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(out)
+	}
+
+	return nil
+}
+
+type Generator struct {
+	PaletteChars  string `json:"paletteChars,omitempty"`
+	Invert        bool   `json:"invert,omitempty"`
+	TargetWidth   int    `json:"targetWidth,omitempty"`
+	TargetHeight  int    `json:"targetHeight,omitempty"`
+	Scaler        string `json:"scaler,omitempty"`
+	Renderer      string `json:"renderer,omitempty"`
+	VarName       string `json:"varName,omitempty"`
+	PaletteOffset int    `json:"paletteOffset,omitempty"`
+}
+
+func (g *Generator) Clone() *Generator {
+	clone := *g
+	return &clone
+}
+
+func (g *Generator) Build(img image.Image) (string, error) {
 	// Rescale:
-	if targetWidth > 0 || targetHeight > 0 {
-		newSize := prepareSize(targetWidth, targetHeight, img.Bounds().Size())
+	if g.TargetWidth > 0 || g.TargetHeight > 0 {
+		newSize := prepareSize(g.TargetWidth, g.TargetHeight, img.Bounds().Size())
 		nb := image.Rectangle{Max: newSize}
 		dst := image.NewRGBA(nb)
-		scl := findScaler(scaler)
+		scl := findScaler(g.Scaler)
 		scl.Scale(dst, nb, img, img.Bounds(), draw.Over, nil)
 		img = dst
 	}
 
 	// Quantise:
-	quant := wu2quant.NewQuantizer()
-	palimg, err := quant.ToPaletted(len(paletteChars), img)
+	quant := wu2quant.New()
+	palimg, err := quant.ToPaletted(len(g.PaletteChars), img)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// Sort colors by intensity (HSP colour space):
 	colors := uniqueColors(palimg)
 	sort.Slice(colors, func(i, j int) bool {
-		if invert {
+		if g.Invert {
 			return hsp(palimg.Palette[colors[i]]) > hsp(palimg.Palette[colors[j]])
 		} else {
 			return hsp(palimg.Palette[colors[i]]) < hsp(palimg.Palette[colors[j]])
@@ -96,35 +149,79 @@ func run() error {
 	// Map the unique, sorted colors back to the palette characters:
 	colorMap := [256]byte{}
 	for i, v := range colors {
-		colorMap[v] = paletteChars[i]
+		colorMap[v] = g.PaletteChars[i]
 	}
+
+	var b bytes.Buffer
+	png.Encode(&b, palimg)
+	os.WriteFile("/tmp/s.png", b.Bytes(), 0600)
 
 	var out bytes.Buffer
 	var renderCtx = &renderContext{
 		colors,
 		colorMap,
-		paletteChars,
+		g,
 		palimg,
-		varName,
 	}
-	if err := render(renderer, renderCtx, &out); err != nil {
+	if err := render(g.Renderer, renderCtx, &out); err != nil {
+		return "", err
+	}
+
+	return out.String(), nil
+}
+
+type Area struct {
+	X   int        `json:"x"`
+	Y   int        `json:"y"`
+	W   int        `json:"w"`
+	H   int        `json:"h"`
+	Gen *Generator `json:"gen,omitempty"`
+}
+
+func (a Area) Rect() image.Rectangle {
+	return image.Rect(a.X, a.Y, a.X+a.W, a.Y+a.H)
+}
+
+type ImageMap struct {
+	Areas []Area     `json:"areas"`
+	Gen   *Generator `json:"gen,omitempty"`
+}
+
+func (im *ImageMap) UnmarshalJSON(b []byte) error {
+	var tmp struct {
+		Gen   *Generator
+		Areas []json.RawMessage
+	}
+	im.Gen = im.Gen.Clone()
+	tmp.Gen = im.Gen
+	var dec = json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&tmp); err != nil {
 		return err
 	}
-	fmt.Println(out.String())
-
+	im.Areas = make([]Area, len(tmp.Areas))
+	for idx, a := range tmp.Areas {
+		im.Areas[idx].Gen = im.Gen.Clone()
+		var areaDec = json.NewDecoder(bytes.NewReader(a))
+		areaDec.DisallowUnknownFields()
+		if err := areaDec.Decode(&im.Areas[idx]); err != nil {
+			return fmt.Errorf("invalid area %d: %w", idx, err)
+		}
+	}
 	return nil
 }
 
 type renderContext struct {
-	colors       []uint8
-	colorMap     [256]byte
-	paletteChars string
-	img          *image.Paletted
-	varName      string
+	colors   []uint8
+	colorMap [256]byte
+	gen      *Generator
+	img      *image.Paletted
 }
 
 func render(renderer string, renderCtx *renderContext, buf *bytes.Buffer) error {
 	switch renderer {
+	case "cpp17":
+		return renderCPP17(renderCtx, buf)
 	case "cpp":
 		return renderCPP(renderCtx, buf)
 	case "js":
@@ -135,66 +232,116 @@ func render(renderer string, renderCtx *renderContext, buf *bytes.Buffer) error 
 }
 
 func renderJS(renderCtx *renderContext, out *bytes.Buffer) error {
+	gen := renderCtx.gen
+
 	// Sad that it has come to this:
 	out.WriteString("// prettier-ignore\n")
 
-	out.WriteString(fmt.Sprintf("const %s = (() => {\n", renderCtx.varName))
+	out.WriteString(fmt.Sprintf("const %s = (() => {\n", gen.VarName))
+
+	seenChars := mapSeenChars(renderCtx.img, renderCtx.colorMap)
+	out.WriteString("  const ")
+	pIdx := 0
 	for idx := range renderCtx.colors {
-		out.WriteString(fmt.Sprintf("  const %c = %d;\n", renderCtx.paletteChars[idx], idx))
+		char := renderCtx.gen.PaletteChars[idx]
+		if seenChars[char] {
+			if pIdx > 0 {
+				out.WriteString(", ")
+			}
+			pIdx++
+			out.WriteString(fmt.Sprintf("%c=%d", char, idx+gen.PaletteOffset))
+		}
 	}
-	out.WriteByte('\n')
+	out.WriteString(";\n")
 
 	out.WriteString("  return [\n")
-
-	yoff := 0
 	width := renderCtx.img.Bounds().Dx()
 	for y := 0; y < renderCtx.img.Bounds().Dy(); y++ {
 		out.WriteString("    ")
 		for x := 0; x < width; x++ {
-			px := renderCtx.img.Pix[yoff+x]
+			px := renderCtx.img.ColorIndexAt(x, y)
 			char := renderCtx.colorMap[px]
 			out.WriteByte(char)
 			out.WriteByte(',')
 		}
-		yoff += width
 		out.WriteByte('\n')
 	}
 	out.WriteString("  ];\n")
-	out.WriteString("});\n")
+	out.WriteString("})();\n")
 
 	return nil
 }
 
 func renderCPP(renderCtx *renderContext, out *bytes.Buffer) error {
+	gen := renderCtx.gen
+
 	for idx := range renderCtx.colors {
-		out.WriteString(fmt.Sprintf("#define %c %d\n", renderCtx.paletteChars[idx], idx))
+		out.WriteString(fmt.Sprintf("#define %c %d\n",
+			gen.PaletteChars[idx], idx+gen.PaletteOffset))
 	}
 	out.WriteByte('\n')
 
 	out.WriteString("static const std::array<uint8_t, ")
 	out.WriteString(fmt.Sprintf("%d*%d", renderCtx.img.Bounds().Dx(), renderCtx.img.Bounds().Dy()))
-	out.WriteString(fmt.Sprintf("> %s = {{\n", renderCtx.varName))
+	out.WriteString(fmt.Sprintf("> %s = {{\n", gen.VarName))
 
-	yoff := 0
 	width := renderCtx.img.Bounds().Dx()
 	for y := 0; y < renderCtx.img.Bounds().Dy(); y++ {
 		out.WriteString("    ")
 		for x := 0; x < width; x++ {
-			px := renderCtx.img.Pix[yoff+x]
+			px := renderCtx.img.ColorIndexAt(x, y)
 			char := renderCtx.colorMap[px]
 			out.WriteByte(char)
 			out.WriteByte(',')
 		}
-		yoff += width
 		out.WriteByte('\n')
 	}
 	out.WriteString("}};\n")
 	out.WriteByte('\n')
 
 	for idx := range renderCtx.colors {
-		out.WriteString(fmt.Sprintf("#undef %c\n", renderCtx.paletteChars[idx]))
+		out.WriteString(fmt.Sprintf("#undef %c\n", gen.PaletteChars[idx]))
 	}
 	out.WriteByte('\n')
+
+	return nil
+}
+
+func renderCPP17(renderCtx *renderContext, out *bytes.Buffer) error {
+	gen := renderCtx.gen
+
+	seenChars := mapSeenChars(renderCtx.img, renderCtx.colorMap)
+
+	szStr := fmt.Sprintf("%d*%d", renderCtx.img.Bounds().Dx(), renderCtx.img.Bounds().Dy())
+	out.WriteString(fmt.Sprintf("static const auto %s = []() constexpr -> const std::array<uint8_t, %s> {\n", gen.VarName, szStr))
+	out.WriteString("    const uint8_t ")
+	pIdx := 0
+	for idx := range renderCtx.colors {
+		char := renderCtx.gen.PaletteChars[idx]
+		if seenChars[char] {
+			if pIdx > 0 {
+				out.WriteString(", ")
+			}
+			pIdx++
+			out.WriteString(fmt.Sprintf("%c=%d", char, idx+gen.PaletteOffset))
+		}
+	}
+	out.WriteString(";\n")
+
+	out.WriteString("    return {{\n")
+	sz := renderCtx.img.Bounds().Size()
+	for y := 0; y < sz.Y; y++ {
+		out.WriteString("        ")
+		for x := 0; x < sz.X; x++ {
+			px := renderCtx.img.ColorIndexAt(x, y)
+			char := renderCtx.colorMap[px]
+			out.WriteByte(char)
+			out.WriteByte(',')
+		}
+		out.WriteByte('\n')
+	}
+	out.WriteString("    }};\n")
+	out.WriteString("}();\n\n")
 
 	return nil
 }
@@ -253,16 +400,27 @@ func hsp(col color.Color) float64 {
 	return math.Sqrt(rfs*rfs + gfs*gfs + bfs*bfs)
 }
 
+func mapSeenChars(img *image.Paletted, colorMap [256]byte) map[byte]bool {
+	out := map[byte]bool{}
+	width := img.Bounds().Dx()
+	for y := 0; y < img.Bounds().Dy(); y++ {
+		for x := 0; x < width; x++ {
+			px := img.ColorIndexAt(x, y)
+			char := colorMap[px]
+			out[char] = true
+		}
+	}
+	return out
+}
+
 func uniqueColors(palimg *image.Paletted) []uint8 {
 	foundColors := [256]bool{}
-	yoff := 0
 	width := palimg.Bounds().Dx()
 	for y := 0; y < palimg.Bounds().Dy(); y++ {
 		for x := 0; x < width; x++ {
-			px := palimg.Pix[yoff+x]
+			px := palimg.ColorIndexAt(x, y)
 			foundColors[px] = true
 		}
-		yoff += width
 	}
 	colors := make([]uint8, 0)
 	for fc, ok := range foundColors {
@@ -271,6 +429,14 @@ func uniqueColors(palimg *image.Paletted) []uint8 {
 		}
 	}
 	return colors
+}
+
+func subImage(img image.Image, r image.Rectangle) image.Image {
+	type subImager interface {
+		SubImage(r image.Rectangle) image.Image
+	}
+	sub := img.(subImager).SubImage(r)
+	return sub
 }
 
 func prepareSize(targetWidth, targetHeight int, orig image.Point) image.Point {

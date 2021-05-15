@@ -131,7 +131,7 @@ func (g *Generator) Build(img image.Image) (string, error) {
 
 	// Quantise:
 	quant := wu2quant.New()
-	palimg, err := quant.ToPaletted(len(g.PaletteChars), img)
+	palimg, err := quant.ToPaletted(len(g.PaletteChars), img, nil)
 	if err != nil {
 		return "", err
 	}
